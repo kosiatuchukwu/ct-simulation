@@ -1,0 +1,103 @@
+% ct_phantom_demo.m - phantom builder: Object + Detail, multi-material
+% Her sheet: Object(size, composition) + Detail(size, composition, position)
+
+KVP          = 80;
+OBJ_MATERIAL = 'water';     % 'water' | 'pmma' | 'al'
+OBJ_DIAM_CM  = 10.0;
+DET_MATERIAL = 'pmma';
+DET_DIAM_CM  = 2.0;
+DET_POSITION = 'centre'; % 'centre' | 'extremity'
+RECON_FILTER = 'Hann';   % 'Ram-Lak' | 'Shepp-Logan' | 'Cosine' | 'Hamming' | 'Hann'
+
+GRID = 180; CIRC_PIX = 160; N_ANGLES = 180;
+PIXEL_SIZE_CM = OBJ_DIAM_CM / CIRC_PIX;
+
+% ---- materials -----------------------------------------------------
+[Eo, mo] = load_material(OBJ_MATERIAL);
+[Ed, md] = load_material(DET_MATERIAL);
+
+% ---- spectrum ------------------------------------------------------
+S = readmatrix(sprintf('spectrum_%dkvp.csv', KVP));
+S = S(~any(isnan(S),2), :);
+energies = S(:,1);  fluence = S(:,2);
+
+% ---- phantom masks: object ring + detail disc ----------------------
+[xx, yy] = meshgrid(0:GRID-1, 0:GRID-1);
+c = (GRID-1)/2;
+obj_mask = ((xx-c).^2 + (yy-c).^2) <= (CIRC_PIX/2)^2;
+
+det_r_pix = (DET_DIAM_CM/OBJ_DIAM_CM) * CIRC_PIX / 2;
+if strcmp(DET_POSITION, 'centre')
+    dc = [c, c];
+else                                   % extremity: 70% of the way out
+    dc = [c + 0.7*CIRC_PIX/2, c];
+end
+det_mask = ((xx-dc(1)).^2 + (yy-dc(2)).^2) <= det_r_pix^2;
+det_mask = det_mask & obj_mask;        % detail lives inside the object
+obj_only = obj_mask & ~det_mask;       % object material excludes detail
+
+% ---- geometric path lengths, one radon per material ----------------
+theta = 0 : 180/N_ANGLES : 180-180/N_ANGLES;
+path_obj = radon(double(obj_only), theta) * PIXEL_SIZE_CM;
+path_det = radon(double(det_mask), theta) * PIXEL_SIZE_CM;
+
+% ---- per-energy Beer-Lambert, both detector models -----------------
+sig_c = zeros(size(path_obj));  sig_i = sig_c;
+sig0_c = 0;  sig0_i = 0;
+for k = 1:numel(energies)
+    E  = energies(k);  N0 = fluence(k);
+    mu_o = exp(interp1(log(Eo), log(mo), log(E)));
+    mu_d = exp(interp1(log(Ed), log(md), log(E)));
+    T = exp(-(mu_o*path_obj + mu_d*path_det));
+    sig_c = sig_c + N0*T;     sig0_c = sig0_c + N0;
+    sig_i = sig_i + E*N0*T;   sig0_i = sig0_i + E*N0;
+end
+% ---- incident statistics: Poisson noise --------------------------------
+N0_PER_PIXEL = 1e6;                       % incident photons per detector pixel
+scale_c = N0_PER_PIXEL / sig0_c;          % normalise so N0_PER_PIXEL photons set out
+sig_c = poissrnd(sig_c * scale_c) / scale_c;
+scale_i = N0_PER_PIXEL / sig0_i;
+sig_i = poissrnd(sig_i * scale_i) / scale_i;
+
+% ---- reconstruct ---------------------------------------------------
+rec_c = iradon(-log(sig_c/sig0_c), theta, RECON_FILTER, GRID) / PIXEL_SIZE_CM;
+rec_i = iradon(-log(sig_i/sig0_i), theta, RECON_FILTER, GRID) / PIXEL_SIZE_CM;
+
+% ---- numbers: mu in detail vs object, contrast ---------------------
+r = sqrt((xx-c).^2 + (yy-c).^2);
+bg_zone  = obj_only & (r < 0.5*CIRC_PIX/2);          % object interior
+det_zone = ((xx-dc(1)).^2+(yy-dc(2)).^2) <= (0.6*det_r_pix)^2;  % detail core
+for p = {{'counting',rec_c}, {'integrating',rec_i}}
+    nm = p{1}{1}; rec = p{1}{2};
+    mu_bg  = mean(rec(bg_zone));
+    mu_det = mean(rec(det_zone));
+    fprintf('%-12s mu_object=%.4f  mu_detail=%.4f  contrast=%.1f%%\n', ...
+            nm, mu_bg, mu_det, 100*(mu_det-mu_bg)/mu_bg);
+end
+
+% ---- figure --------------------------------------------------------
+figure;
+subplot(1,2,1); imagesc(rec_i); axis image off; colormap gray; colorbar;
+title(sprintf('%s object + %s detail (%d kVp, integrating)', ...
+      OBJ_MATERIAL, DET_MATERIAL, KVP));
+mid = round(dc(2)) + 1;
+subplot(1,2,2);
+plot(rec_i(mid,:), 'b'); grid on;
+xlabel('pixel'); ylabel('\mu (1/cm)');
+title('Profile through the detail');
+
+% ---- local functions ----------------------------------------------
+function [E_keV, mu_cm] = load_material(name)
+    switch lower(name)
+        case 'water', fname = 'water_mu.txt'; rho = 1.00;
+        case 'pmma',  fname = 'pmma_mu.txt';  rho = 1.19;
+        case 'al',    fname = 'al_mu.txt';    rho = 2.70;
+        otherwise, error('Unknown material: %s', name);
+    end
+    M = readmatrix(fname, 'FileType','text');
+    M = M(~any(isnan(M),2), :);
+    E_keV = M(:,1) * 1000;
+    mu_cm = M(:,2) * rho;                  % mu/rho x density -> 1/cm
+    keep  = [true; diff(E_keV) > 0];       % drop duplicate edge energies (Al K-edge)
+    E_keV = E_keV(keep);  mu_cm = mu_cm(keep);
+end
