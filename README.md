@@ -1,7 +1,5 @@
 # Interactive CT Simulation Engine
 
-MSc dissertation project — University of Surrey, 2026.
-
 ## What it does
 A polychromatic CT simulation engine in MATLAB for teaching 
 image quality trade-offs.
